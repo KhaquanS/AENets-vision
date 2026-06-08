@@ -19,7 +19,7 @@ This simple change produces students that:
 
 ## Architecture
 
-![AENet Architecture](assets/aenet_architecture.png)
+![AENet Architecture](assets/AENets-architecture.png)
 
 *Left: FitNets uses a learned regressor and an L2 hint loss to align the student's features up to the teacher's dimensionality. Right: AENet uses a lightweight convolutional autoencoder to compress the teacher's hint down to the student's dimensionality, then directly injects it into the student's guided layer — no hint loss required.*
 
