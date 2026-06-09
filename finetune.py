@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import logging
 import math
@@ -62,6 +63,16 @@ def setup_logger(run_dir: Path) -> logging.Logger:
     return logger
 
 
+def csv_log_epoch(run_dir: Path, row: Dict) -> None:
+    csv_path = run_dir / "metrics.csv"
+    write_header = not csv_path.exists()
+    with open(csv_path, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(row.keys()))
+        if write_header:
+            writer.writeheader()
+        writer.writerow(row)
+
+
 def save_json(path: Path, payload: Dict) -> None:
     path.write_text(json.dumps(payload, indent=2, default=str))
 
@@ -113,7 +124,6 @@ def train_one_epoch(
     criterion,
     scaler,
     amp: bool,
-    logger: logging.Logger,
     epoch: int,
     grad_clip: float,
     phase: str = "train",
@@ -154,18 +164,6 @@ def train_one_epoch(
         total_correct += (logits.argmax(1) == targets).sum().item()
         total_samples += bs
         pbar.set_postfix(loss=total_loss / total_samples, acc=total_correct / total_samples)
-
-        logger.info(
-            json.dumps(
-                {
-                    "epoch": epoch,
-                    "phase": phase,
-                    "step": step,
-                    "loss": float(loss.item()),
-                    "acc": float((logits.argmax(1) == targets).float().mean().item()),
-                }
-            )
-        )
 
     return {"loss": total_loss / total_samples, "acc": total_correct / total_samples}
 
@@ -282,7 +280,7 @@ def main(args):
 
     logger.info("========== Training ==========")
     for epoch in range(start_epoch, args.epochs + 1):
-        train_metrics = train_one_epoch(model, train_loader, optimizer, device, criterion, scaler, args.amp, logger, epoch, args.grad_clip, phase="train")
+        train_metrics = train_one_epoch(model, train_loader, optimizer, device, criterion, scaler, args.amp, epoch, args.grad_clip, phase="train")
         val_metrics = evaluate(model, val_loader, device, criterion) if val_loader is not None else {"loss": float("nan"), "acc": float("nan")}
 
         if scheduler is not None:
@@ -296,6 +294,14 @@ def main(args):
             val_metrics["loss"],
             val_metrics["acc"],
         )
+
+        csv_log_epoch(run_dir, {
+            "epoch": epoch,
+            "train_loss": train_metrics["loss"],
+            "train_acc": train_metrics["acc"],
+            "val_loss": val_metrics["loss"],
+            "val_acc": val_metrics["acc"],
+        })
 
         ckpt = {
             "epoch": epoch,

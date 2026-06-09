@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import logging
 import math
@@ -53,6 +54,16 @@ def setup_logger(run_dir: Path, filename: str = "distill.log") -> logging.Logger
     logger.addHandler(stream_handler)
     logger.propagate = False
     return logger
+
+
+def csv_log_epoch(run_dir: Path, row: Dict) -> None:
+    csv_path = run_dir / "metrics.csv"
+    write_header = not csv_path.exists()
+    with open(csv_path, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(row.keys()))
+        if write_header:
+            writer.writeheader()
+        writer.writerow(row)
 
 
 def save_json(path: Path, payload: Dict) -> None:
@@ -228,7 +239,6 @@ def train_one_epoch(
     device: torch.device,
     scaler,
     amp: bool,
-    logger: logging.Logger,
     epoch: int,
     args,
 ):
@@ -284,21 +294,6 @@ def train_one_epoch(
             postfix["recon"] = extra_totals["recon"] / totals["n"]
             postfix["sparse"] = extra_totals["sparse"] / totals["n"]
         pbar.set_postfix(postfix)
-
-        record = {
-            "phase": "train",
-            "epoch": epoch,
-            "step": step,
-            "scheme": scheme,
-            "loss": float(loss.item()),
-            "ce_loss": float(out["ce_loss"].item()),
-            "distill_loss": float(out["distill_loss"].item()),
-            "acc": float(acc),
-        }
-        if scheme == "sae_injection":
-            record["reconstruction_loss"] = float(out["reconstruction_loss"].item())
-            record["sparsity_loss"] = float(out["sparsity_loss"].item())
-        logger.info(json.dumps(record))
 
     metrics = {
         "loss": totals["loss"] / max(totals["n"], 1),
@@ -508,7 +503,7 @@ def main(args):
 
     logger.info("========== Training ==========")
     for epoch in range(start_epoch, args.epochs + 1):
-        train_metrics = train_one_epoch(model, args.scheme, train_loader, optimizer, device, scaler, args.amp, logger, epoch, args)
+        train_metrics = train_one_epoch(model, args.scheme, train_loader, optimizer, device, scaler, args.amp, epoch, args)
         val_metrics = evaluate(model, args.scheme, val_loader, device, args) if val_loader is not None else {"loss": float("nan"), "ce_loss": float("nan"), "distill_loss": float("nan"), "acc": float("nan")}
 
         if scheduler is not None:
@@ -522,6 +517,7 @@ def main(args):
             val_metrics["loss"],
             val_metrics["acc"],
         )
+
         if args.scheme == "sae_injection":
             logger.info(
                 "epoch=%d | train_ce=%.6f | train_sae=%.6f | train_recon=%.6f | train_sparse=%.6f | val_ce=%.6f | val_sae=%.6f | val_recon=%.6f | val_sparse=%.6f",
@@ -535,6 +531,21 @@ def main(args):
                 val_metrics.get("reconstruction_loss", float("nan")),
                 val_metrics.get("sparsity_loss", float("nan")),
             )
+            csv_log_epoch(run_dir, {
+                "epoch": epoch,
+                "train_loss": train_metrics["loss"],
+                "train_acc": train_metrics["acc"],
+                "train_ce_loss": train_metrics["ce_loss"],
+                "train_distill_loss": train_metrics["distill_loss"],
+                "train_reconstruction_loss": train_metrics.get("reconstruction_loss", float("nan")),
+                "train_sparsity_loss": train_metrics.get("sparsity_loss", float("nan")),
+                "val_loss": val_metrics["loss"],
+                "val_acc": val_metrics["acc"],
+                "val_ce_loss": val_metrics["ce_loss"],
+                "val_distill_loss": val_metrics["distill_loss"],
+                "val_reconstruction_loss": val_metrics.get("reconstruction_loss", float("nan")),
+                "val_sparsity_loss": val_metrics.get("sparsity_loss", float("nan")),
+            })
         else:
             logger.info(
                 "epoch=%d | train_ce=%.6f | train_distill=%.6f | val_ce=%.6f | val_distill=%.6f",
@@ -544,6 +555,17 @@ def main(args):
                 val_metrics["ce_loss"],
                 val_metrics["distill_loss"],
             )
+            csv_log_epoch(run_dir, {
+                "epoch": epoch,
+                "train_loss": train_metrics["loss"],
+                "train_acc": train_metrics["acc"],
+                "train_ce_loss": train_metrics["ce_loss"],
+                "train_distill_loss": train_metrics["distill_loss"],
+                "val_loss": val_metrics["loss"],
+                "val_acc": val_metrics["acc"],
+                "val_ce_loss": val_metrics["ce_loss"],
+                "val_distill_loss": val_metrics["distill_loss"],
+            })
 
         checkpoint = {
             "epoch": epoch,
