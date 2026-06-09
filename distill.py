@@ -103,24 +103,59 @@ def get_scheduler(name: str, optimizer, epochs: int, step_size: int, gamma: floa
     raise ValueError(f"Unsupported scheduler: {name}")
 
 
+def _is_checkpoint_path(s: str) -> bool:
+    return s not in ("none", "default") and (s.endswith(".pt") or s.endswith(".pth") or s.startswith("/") or s.startswith("./") or os.path.exists(s))
+
+
+def _load_checkpoint_into(model: nn.Module, path: str) -> nn.Module:
+    ckpt = torch.load(path, map_location="cpu")
+    # support plain state_dicts as well as our own checkpoint dicts
+    if isinstance(ckpt, dict):
+        state_dict = (
+            ckpt.get("model_state_dict")
+            or ckpt.get("state_dict")
+            or ckpt.get("model")
+            or ckpt
+        )
+    else:
+        state_dict = ckpt
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    if missing:
+        print(f"[checkpoint] missing keys ({len(missing)}): {missing[:5]}{'...' if len(missing) > 5 else ''}")
+    if unexpected:
+        print(f"[checkpoint] unexpected keys ({len(unexpected)}): {unexpected[:5]}{'...' if len(unexpected) > 5 else ''}")
+    return model
+
+
 def build_models(args, num_classes: int):
-    teacher_weights = None if args.teacher_weights == "none" else ("DEFAULT" if args.teacher_weights == "default" else args.teacher_weights)
-    student_weights = None if args.student_weights == "none" else ("DEFAULT" if args.student_weights == "default" else args.student_weights)
+    teacher_is_ckpt = _is_checkpoint_path(args.teacher_weights)
+    student_is_ckpt = _is_checkpoint_path(args.student_weights)
+
+    teacher_weights = None if (args.teacher_weights == "none" or teacher_is_ckpt) else ("DEFAULT" if args.teacher_weights == "default" else args.teacher_weights)
+    student_weights = None if (args.student_weights == "none" or student_is_ckpt) else ("DEFAULT" if args.student_weights == "default" else args.student_weights)
 
     teacher = build_torchvision_model(
         args.teacher_name,
         num_classes=num_classes,
         weights=teacher_weights,
-        pretrained=(args.teacher_weights != "none"),
+        pretrained=(args.teacher_weights != "none" and not teacher_is_ckpt),
         strict_head=False,
     )
+    if teacher_is_ckpt:
+        print(f"[build_models] loading teacher checkpoint from {args.teacher_weights}")
+        teacher = _load_checkpoint_into(teacher, args.teacher_weights)
+
     student = build_torchvision_model(
         args.student_name,
         num_classes=num_classes,
         weights=student_weights,
-        pretrained=(args.student_weights != "none"),
+        pretrained=(args.student_weights != "none" and not student_is_ckpt),
         strict_head=False,
     )
+    if student_is_ckpt:
+        print(f"[build_models] loading student checkpoint from {args.student_weights}")
+        student = _load_checkpoint_into(student, args.student_weights)
+
     return teacher, student
 
 
