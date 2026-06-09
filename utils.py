@@ -361,38 +361,88 @@ class ViTSuffix(nn.Module):
         raise ValueError(f"Unsupported ViT start: {self.start}")
 
 
+def _probe_module_output_spec(module: nn.Module, dummy: torch.Tensor) -> FeatureSpec:
+    """Run a dummy forward pass and convert the output tensor shape to a FeatureSpec."""
+    training = module.training
+    module.eval()
+    with torch.no_grad():
+        out = module(dummy)
+    module.train(training)
+    if out.dim() == 4:
+        return FeatureSpec("map", channels=out.shape[1], height=out.shape[2], width=out.shape[3])
+    if out.dim() == 3:
+        return FeatureSpec("tokens", channels=out.shape[2], tokens=out.shape[1], has_cls_token=True)
+    return FeatureSpec("vector", channels=out.shape[1])
+
+
+def _make_dummy_image(backbone: nn.Module, batch_size: int = 2) -> torch.Tensor:
+    """Create a minimal dummy input image on the same device as the backbone."""
+    device = next(backbone.parameters()).device
+    return torch.zeros(batch_size, 3, 224, 224, device=device)
+
+
+def _prior_resnet_cut(start: str) -> Optional[str]:
+    """
+    Return the cut point whose output equals the input tensor of ``start``.
+    E.g. the input to layer2 is the output of layer1, so return "layer1".
+    Returns None when start is the earliest possible point (stem).
+    """
+    order = ["stem", "layer1", "layer2", "layer3", "layer4", "avgpool", "flatten", "fc"]
+    base, idx = _parse_point(start)
+    if base not in order:
+        return None
+    pos = order.index(base)
+    if pos == 0:
+        return None
+    # Block-level granularity: input to block[idx] == output of block[idx-1].
+    if idx is not None and idx > 0:
+        return f"{base}[{idx - 1}]"
+    return order[pos - 1]
+
+
+def _prior_vgg_cut(backbone: nn.Module, start: str) -> Optional[str]:
+    """Return the VGG cut point just before ``start``."""
+    base, idx = _parse_point(start)
+    if base == "features":
+        if idx is None or idx == 0:
+            return None
+        return f"features[{idx - 1}]"
+    if base == "avgpool":
+        return f"features[{len(backbone.features) - 1}]"
+    if base == "flatten":
+        return "avgpool"
+    if base == "classifier":
+        return "flatten" if (idx is None or idx == 0) else f"classifier[{idx - 1}]"
+    return None
+
+
+def _prior_vit_cut(backbone: nn.Module, start: str) -> Optional[str]:
+    """Return the ViT cut point just before ``start``."""
+    base, idx = _parse_point(start)
+    if base == "encoder.layers":
+        if idx is None or idx == 0:
+            return None
+        return f"encoder.layers[{idx - 1}]"
+    if base in {"encoder", "heads", "logits"}:
+        n = len(backbone.encoder.layers)
+        return f"encoder.layers[{n - 1}]"
+    return None
+
+
 def teacher_prefix_slice(backbone: nn.Module, cut: Optional[str] = None) -> BackboneSlice:
     family = infer_backbone_family(backbone)
     cut = cut or default_cut(family)
 
     if family == "resnet":
         module = ResNetPrefix(backbone, cut)
-        base, _ = _parse_point(cut)
-        output_spec = FeatureSpec("map", channels=_resnet_stage_out_channels(base))
     elif family == "vgg":
         module = VGGPrefix(backbone, cut)
-        base, idx = _parse_point(cut)
-        if base == "features":
-            output_spec = FeatureSpec("map", channels=_vgg_feature_channels(backbone, idx or 0))
-        elif base == "avgpool":
-            output_spec = FeatureSpec("map", channels=_vgg_feature_channels(backbone, len(backbone.features) - 1), height=7, width=7)
-        elif base == "flatten":
-            ch = _vgg_feature_channels(backbone, len(backbone.features) - 1)
-            output_spec = FeatureSpec("vector", channels=ch * 7 * 7)
-        else:
-            output_spec = FeatureSpec("vector", channels=backbone.classifier[-1].out_features if hasattr(backbone, "classifier") else 1000)
     elif family == "vit":
         module = ViTPrefix(backbone, cut)
-        hidden = backbone.hidden_dim if hasattr(backbone, "hidden_dim") else backbone.encoder.layers[0].ln_1.normalized_shape[0]
-        tokens = backbone.encoder.pos_embedding.shape[1]
-        base, _ = _parse_point(cut)
-        if base in {"heads", "logits"}:
-            output_spec = FeatureSpec("vector", channels=getattr(backbone.heads.head, "out_features", 1000))
-        else:
-            output_spec = FeatureSpec("tokens", channels=hidden, tokens=tokens, has_cls_token=True)
     else:
         raise ValueError(f"Unsupported backbone family: {family}")
 
+    output_spec = _probe_module_output_spec(module, _make_dummy_image(backbone))
     return BackboneSlice(module=module, family=family, point=cut, output_spec=output_spec)
 
 
@@ -402,31 +452,29 @@ def student_suffix_slice(backbone: nn.Module, start: Optional[str] = None) -> Ba
 
     if family == "resnet":
         module = ResNetSuffix(backbone, start)
-        base, _ = _parse_point(start)
-        input_spec = FeatureSpec("map", channels=_resnet_stage_in_channels(base))
         output_spec = FeatureSpec("vector", channels=backbone.fc.out_features)
+        prior_cut = _prior_resnet_cut(start)
     elif family == "vgg":
         module = VGGSuffix(backbone, start)
-        base, _ = _parse_point(start)
-        if base == "features":
-            input_spec = FeatureSpec("map", channels=_vgg_input_channels_for_start(backbone, start))
-        elif base == "avgpool":
-            input_spec = FeatureSpec("map", channels=_vgg_feature_channels(backbone, len(backbone.features) - 1))
-        else:
-            input_spec = FeatureSpec("vector", channels=_vgg_input_channels_for_start(backbone, start))
         output_spec = FeatureSpec("vector", channels=backbone.classifier[-1].out_features if isinstance(backbone.classifier, nn.Sequential) and isinstance(backbone.classifier[-1], nn.Linear) else 1000)
+        prior_cut = _prior_vgg_cut(backbone, start)
     elif family == "vit":
         module = ViTSuffix(backbone, start)
-        hidden = backbone.hidden_dim if hasattr(backbone, "hidden_dim") else backbone.encoder.layers[0].ln_1.normalized_shape[0]
-        tokens = backbone.encoder.pos_embedding.shape[1]
-        base, _ = _parse_point(start)
-        if base in {"heads", "logits"}:
-            input_spec = FeatureSpec("tokens", channels=hidden, tokens=tokens, has_cls_token=True)
-        else:
-            input_spec = FeatureSpec("tokens", channels=hidden, tokens=tokens, has_cls_token=True)
         output_spec = FeatureSpec("vector", channels=getattr(backbone.heads.head, "out_features", 1000))
+        prior_cut = _prior_vit_cut(backbone, start)
     else:
         raise ValueError(f"Unsupported backbone family: {family}")
+
+    # Probe the tensor shape that *enters* the suffix by running a prefix that stops
+    # one stage before `start`.  This is what the adapter encoder must output.
+    dummy = _make_dummy_image(backbone)
+    if prior_cut is not None:
+        prefix_cls = {"resnet": ResNetPrefix, "vgg": VGGPrefix, "vit": ViTPrefix}[family]
+        prior_prefix = prefix_cls(backbone, prior_cut)
+        input_spec = _probe_module_output_spec(prior_prefix, dummy)
+    else:
+        # start is the very first stage; input is the raw image tensor.
+        input_spec = FeatureSpec("map", channels=dummy.shape[1], height=dummy.shape[2], width=dummy.shape[3])
 
     return BackboneSlice(module=module, family=family, point=start, input_spec=input_spec, output_spec=output_spec)
 
